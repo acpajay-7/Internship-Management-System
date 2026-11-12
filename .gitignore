@@ -1,0 +1,9 @@
+﻿.env
+__pycache__/
+*.py[cod]
+data/*.db
+uploads/*
+!uploads/.gitkeep
+generated/*
+!generated/.gitkeep
+.venv/
