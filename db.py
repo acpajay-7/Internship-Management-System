@@ -16,6 +16,105 @@ DB_PATH = os.getenv("DATABASE_PATH", "data/reincrew.db")
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 
+class _DictRow(dict):
+  """Supports both row['col'] and row[0] indexing like sqlite3.Row."""
+
+  def __init__(self, columns, values):
+    super().__init__(zip(columns, values))
+    self._values = tuple(values)
+
+  def __getitem__(self, key):
+    if isinstance(key, int):
+      return self._values[key]
+    return super().__getitem__(key)
+
+
+class _LibsqlCursorWrapper:
+
+  def __init__(self, raw_cursor):
+    self._cur = raw_cursor
+
+  @property
+  def description(self):
+    return self._cur.description
+
+  @property
+  def lastrowid(self):
+    return getattr(self._cur, "lastrowid", None)
+
+  @property
+  def rowcount(self):
+    return getattr(self._cur, "rowcount", -1)
+
+  def _wrap_row(self, row):
+    if row is None or not self._cur.description:
+      return row
+    cols = [d[0] for d in self._cur.description]
+    return _DictRow(cols, row)
+
+  def execute(self, sql, params=()):
+    self._cur.execute(sql, params)
+    return self
+
+  def executemany(self, sql, seq_of_params):
+    self._cur.executemany(sql, seq_of_params)
+    return self
+
+  def fetchone(self):
+    return self._wrap_row(self._cur.fetchone())
+
+  def fetchall(self):
+    rows = self._cur.fetchall()
+    if not rows or not self._cur.description:
+      return rows
+    cols = [d[0] for d in self._cur.description]
+    return [_DictRow(cols, r) for r in rows]
+
+
+class _LibsqlConnWrapper:
+  """Makes libsql connection compatible with sqlite3 context managers, row access, and pandas."""
+
+  def __init__(self, raw_conn):
+    self._conn = raw_conn
+
+  def cursor(self):
+    return _LibsqlCursorWrapper(self._conn.cursor())
+
+  def execute(self, sql, params=()):
+    cur = self.cursor()
+    cur.execute(sql, params)
+    return cur
+
+  def executemany(self, sql, seq_of_params):
+    cur = self.cursor()
+    cur.executemany(sql, seq_of_params)
+    return cur
+
+  def executescript(self, script):
+    self._conn.executescript(script)
+
+  def commit(self):
+    self._conn.commit()
+
+  def sync(self):
+    if hasattr(self._conn, "sync"):
+      self._conn.sync()
+
+  def close(self):
+    if hasattr(self._conn, "close"):
+      self._conn.close()
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    if exc_type is None:
+      self.commit()
+      self.sync()
+    self.close()
+    return False
+
+
 def _sync_if_remote(conn):
   if hasattr(conn, "sync"):
     conn.sync()
@@ -26,15 +125,17 @@ def get_conn():
   turso_token = os.getenv("TURSO_AUTH_TOKEN")
 
   if turso_url and turso_token and libsql is not None:
-    conn = libsql.connect(
+    raw = libsql.connect(
         "data/reincrew_replica.db",
         sync_url=turso_url,
         auth_token=turso_token,
     )
-    conn.sync()
-  else:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    raw.sync()
+    conn = _LibsqlConnWrapper(raw)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   conn.row_factory = sqlite3.Row
   conn.execute("PRAGMA foreign_keys=ON")
   return conn
