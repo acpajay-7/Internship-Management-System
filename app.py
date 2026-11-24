@@ -21,6 +21,8 @@ try:
       "SMTP_PASSWORD",
       "SMTP_FROM",
       "DATABASE_PATH",
+      "TURSO_DATABASE_URL",
+      "TURSO_AUTH_TOKEN",
   ]:
     if secret_key in st.secrets:
       os.environ[secret_key] = str(st.secrets[secret_key])
@@ -66,6 +68,8 @@ def execute(sql, params=()):
   with get_conn() as conn:
     conn.execute(sql, params)
     conn.commit()
+    if hasattr(conn, "sync"):
+      conn.sync()
 
 
 def notify(to_email, subject, body, attachment_path=None):
@@ -613,6 +617,8 @@ if role in ("admin", "hr"):
                     conn, intern_id, domain
                 )
                 conn.commit()
+                if hasattr(conn, "sync"):
+                  conn.sync()
 
               # 5. Send Email with Offer Letter PDF + 5-Digit Login Password
               subject = (

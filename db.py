@@ -7,12 +7,34 @@ from pathlib import Path
 import sqlite3
 import uuid
 
+try:
+  import libsql
+except ImportError:
+  libsql = None
+
 DB_PATH = os.getenv("DATABASE_PATH", "data/reincrew.db")
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _sync_if_remote(conn):
+  if hasattr(conn, "sync"):
+    conn.sync()
+
+
 def get_conn():
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  turso_url = os.getenv("TURSO_DATABASE_URL")
+  turso_token = os.getenv("TURSO_AUTH_TOKEN")
+
+  if turso_url and turso_token and libsql is not None:
+    conn = libsql.connect(
+        "data/reincrew_replica.db",
+        sync_url=turso_url,
+        auth_token=turso_token,
+    )
+    conn.sync()
+  else:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
   conn.row_factory = sqlite3.Row
   conn.execute("PRAGMA foreign_keys=ON")
   return conn
@@ -290,6 +312,7 @@ def init_db():
           ],
       )
     c.commit()
+    _sync_if_remote(c)
 
 
 def submit_application_idempotent(
@@ -345,6 +368,7 @@ def submit_application_idempotent(
       )
       if own_conn:
         c.commit()
+        _sync_if_remote(c)
       return {
           "status": "created",
           "idempotent": False,
@@ -397,6 +421,7 @@ def log_audit(
     )
     if own_conn:
       c.commit()
+      _sync_if_remote(c)
     return cursor.lastrowid
   finally:
     if own_conn:
@@ -444,6 +469,7 @@ def create_hr_user(
         (clean_email, hash_password(hr_password), "hr"),
     )
     c.commit()
+    _sync_if_remote(c)
   log_audit(
       actor_email=super_admin_email,
       actor_role=super_admin_role,
@@ -468,6 +494,7 @@ def delete_hr_user(super_admin_email, super_admin_role, target_hr_email):
       return False, f"HR account '{clean_target}' not found."
     c.execute("DELETE FROM users WHERE id=?", (row["id"],))
     c.commit()
+    _sync_if_remote(c)
   log_audit(
       actor_email=super_admin_email,
       actor_role=super_admin_role,
@@ -498,17 +525,16 @@ def delete_intern_access(actor_email, actor_role, internship_id):
     clean_email = (intern["email"] or "").strip().lower()
     old_status = intern["status"]
 
-    # 1. Delete intern login credentials from users table
     c.execute(
         "DELETE FROM users WHERE lower(email)=? AND role='intern'",
         (clean_email,),
     )
-    # 2. Mark intern record as Access Revoked so historical reports/docs remain intact
     c.execute(
         "UPDATE interns SET status='Access Revoked' WHERE internship_id=?",
         (internship_id,),
     )
     c.commit()
+    _sync_if_remote(c)
 
   log_audit(
       actor_email=actor_email,
@@ -556,6 +582,7 @@ def change_user_password(email, old_password, new_password):
         (hash_password(new_password), row["id"]),
     )
     c.commit()
+    _sync_if_remote(c)
   return True, "Password updated successfully!"
 
 
@@ -571,12 +598,14 @@ def upsert_intern_user(email, password):
             (hash_password(password), email.lower()),
         )
         c.commit()
+        _sync_if_remote(c)
     else:
       c.execute(
           "INSERT INTO users(email,password_hash,role) VALUES(?,?,?)",
           (email.lower(), hash_password(password), "intern"),
       )
       c.commit()
+      _sync_if_remote(c)
 
 
 def verify_user(email, password, expected_roles=None):
@@ -599,3 +628,4 @@ def log_email(recipient, subject, status, detail):
         (recipient, subject, status, detail),
     )
     c.commit()
+    _sync_if_remote(c)
