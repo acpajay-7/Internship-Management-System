@@ -10,7 +10,7 @@
     "new_value": {
       "doc_type": "Offer Letter"
     },
-    "created_at": "2026-11-24T22:40:49"
+    "created_at": "2026-11-24T23:20:06"
   },
   {
     "id": 2,
@@ -25,7 +25,7 @@
     "new_value": {
       "status": "Selected"
     },
-    "created_at": "2026-11-24T22:40:49"
+    "created_at": "2026-11-24T23:20:06"
   },
   {
     "id": 1,
@@ -40,6 +40,6 @@
       "email": "hr@reincrew.local",
       "role": "hr"
     },
-    "created_at": "2026-11-24T22:40:49"
+    "created_at": "2026-11-24T23:20:06"
   }
 ]
