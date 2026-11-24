@@ -1,8 +1,11 @@
+from datetime import datetime
 import hashlib
 import hmac
+import json
 import os
 from pathlib import Path
 import sqlite3
+import uuid
 
 DB_PATH = os.getenv("DATABASE_PATH", "data/reincrew.db")
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -30,12 +33,75 @@ def check_password(password, stored):
     return False
 
 
+def apply_audit_schema(conn, schema_path="audit_log_schema.sql"):
+  if Path(schema_path).exists():
+    conn.executescript(Path(schema_path).read_text(encoding="utf-8"))
+  else:
+    conn.executescript("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_application
+        ON applications (lower(email))
+        WHERE status IN ('Received', 'Under Review', 'Shortlisted', 'Interview Scheduled', 'Selected');
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_email TEXT NOT NULL,
+            actor_role TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('CREATE', 'STATUS_CHANGE', 'DOC_GENERATED', 'DELETE')),
+            target_entity TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+
 def init_db():
   with get_conn() as c:
+    existing_users_sql = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    if existing_users_sql and "'hr'" not in existing_users_sql["sql"]:
+      c.executescript("""
+            ALTER TABLE users RENAME TO users_old;
+            CREATE TABLE users(
+              id INTEGER PRIMARY KEY,
+              email TEXT UNIQUE NOT NULL,
+              password_hash TEXT NOT NULL,
+              role TEXT NOT NULL CHECK(role IN ('admin','hr','intern')),
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO users(id, email, password_hash, role, created_at)
+            SELECT id, email, password_hash, role, created_at FROM users_old;
+            DROP TABLE users_old;
+            """)
+
+    existing_audit_sql = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_logs'"
+    ).fetchone()
+    if existing_audit_sql and "'DELETE'" not in existing_audit_sql["sql"]:
+      c.executescript("""
+            ALTER TABLE audit_logs RENAME TO audit_logs_old;
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_email TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action_type TEXT NOT NULL CHECK (action_type IN ('CREATE', 'STATUS_CHANGE', 'DOC_GENERATED', 'DELETE')),
+                target_entity TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO audit_logs(id, actor_email, actor_role, action_type, target_entity, target_id, old_value, new_value, created_at)
+            SELECT id, actor_email, actor_role, action_type, target_entity, target_id, old_value, new_value, created_at FROM audit_logs_old;
+            DROP TABLE audit_logs_old;
+            """)
+
     c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
           id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK(role IN ('admin','intern')), created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+          role TEXT NOT NULL CHECK(role IN ('admin','hr','intern')), created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS internships(
           id INTEGER PRIMARY KEY, title TEXT NOT NULL, domain TEXT NOT NULL, department TEXT,
           duration TEXT, description TEXT, active INTEGER DEFAULT 1);
@@ -67,7 +133,8 @@ def init_db():
           created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         """)
 
-    # Safe schema migration if documents table existed without doc_type
+    apply_audit_schema(c)
+
     cols = [
         row["name"]
         for row in c.execute("PRAGMA table_info(documents)").fetchall()
@@ -78,7 +145,6 @@ def init_db():
           " Letter'"
       )
 
-    # Seed default admin
     if (
         c.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
         == 0
@@ -90,7 +156,6 @@ def init_db():
           (admin_email.lower(), hash_password(admin_password), "admin"),
       )
 
-    # Seed default internships
     if c.execute("SELECT COUNT(*) FROM internships").fetchone()[0] == 0:
       c.executemany(
           """INSERT INTO internships(title,domain,department,duration,description,active)
@@ -126,7 +191,6 @@ def init_db():
           ],
       )
 
-    # Seed default stream-based task templates
     if c.execute("SELECT COUNT(*) FROM task_templates").fetchone()[0] == 0:
       c.executemany(
           """INSERT INTO task_templates(domain,title,description,priority,due_days)
@@ -228,17 +292,274 @@ def init_db():
     c.commit()
 
 
-def create_user(email, password, role):
+def submit_application_idempotent(
+    full_name,
+    email,
+    phone,
+    college,
+    education,
+    skills,
+    preferred_domain,
+    resume_path="",
+    conn=None,
+):
+  clean_email = email.strip().lower()
+  if not clean_email or "@" not in clean_email:
+    raise ValueError("Valid email is required.")
+
+  own_conn = conn is None
+  c = get_conn() if own_conn else conn
+  try:
+    existing = c.execute(
+        """SELECT application_id, status FROM applications
+               WHERE lower(email)=? AND status IN ('Received', 'Under Review', 'Shortlisted', 'Interview Scheduled', 'Selected')""",
+        (clean_email,),
+    ).fetchone()
+    if existing:
+      return {
+          "status": "duplicate_ignored",
+          "idempotent": True,
+          "application_id": existing["application_id"],
+          "current_status": existing["status"],
+      }
+
+    app_id = "APP-" + uuid.uuid4().hex[:10].upper()
+    try:
+      c.execute(
+          """INSERT INTO applications
+                   (application_id, full_name, email, phone, college, education, skills, preferred_domain, resume_path, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+          (
+              app_id,
+              full_name.strip(),
+              clean_email,
+              phone.strip(),
+              college.strip(),
+              education.strip(),
+              skills.strip(),
+              preferred_domain,
+              resume_path,
+              "Received",
+              datetime.now().isoformat(timespec="seconds"),
+          ),
+      )
+      if own_conn:
+        c.commit()
+      return {
+          "status": "created",
+          "idempotent": False,
+          "application_id": app_id,
+          "current_status": "Received",
+      }
+    except sqlite3.IntegrityError:
+      existing = c.execute(
+          "SELECT application_id, status FROM applications WHERE lower(email)=?"
+          " ORDER BY id DESC LIMIT 1",
+          (clean_email,),
+      ).fetchone()
+      return {
+          "status": "duplicate_ignored",
+          "idempotent": True,
+          "application_id": existing["application_id"],
+          "current_status": existing["status"],
+      }
+  finally:
+    if own_conn:
+      c.close()
+
+
+def log_audit(
+    actor_email,
+    actor_role,
+    action_type,
+    target_entity,
+    target_id,
+    old_value=None,
+    new_value=None,
+    conn=None,
+):
+  own_conn = conn is None
+  c = get_conn() if own_conn else conn
+  try:
+    cursor = c.execute(
+        """INSERT INTO audit_logs(actor_email, actor_role, action_type, target_entity, target_id, old_value, new_value, created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            actor_email.strip().lower(),
+            actor_role,
+            action_type,
+            target_entity,
+            str(target_id),
+            json.dumps(old_value) if old_value is not None else None,
+            json.dumps(new_value) if new_value is not None else None,
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    if own_conn:
+      c.commit()
+    return cursor.lastrowid
+  finally:
+    if own_conn:
+      c.close()
+
+
+def fetch_audit_logs(limit=100, conn=None):
+  own_conn = conn is None
+  c = get_conn() if own_conn else conn
+  try:
+    rows = c.execute(
+        "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    result = []
+    for r in rows:
+      d = dict(r)
+      for col in ("old_value", "new_value"):
+        if d[col]:
+          try:
+            d[col] = json.loads(d[col])
+          except Exception:
+            pass
+      result.append(d)
+    return result
+  finally:
+    if own_conn:
+      c.close()
+
+
+def create_hr_user(
+    super_admin_email, super_admin_role, hr_name, hr_email, hr_password
+):
+  if super_admin_role != "admin":
+    raise PermissionError("Only Super Admin ('admin') can create HR accounts.")
+  clean_email = hr_email.strip().lower()
+  clean_name = hr_name.strip()
   with get_conn() as c:
+    existing = c.execute(
+        "SELECT id, role FROM users WHERE email=?", (clean_email,)
+    ).fetchone()
+    if existing:
+      return False, f"User {clean_email} already exists ({existing['role']})."
     c.execute(
         "INSERT INTO users(email,password_hash,role) VALUES(?,?,?)",
-        (email.lower(), hash_password(password), role),
+        (clean_email, hash_password(hr_password), "hr"),
+    )
+    c.commit()
+  log_audit(
+      actor_email=super_admin_email,
+      actor_role=super_admin_role,
+      action_type="CREATE",
+      target_entity="user",
+      target_id=clean_email,
+      old_value=None,
+      new_value={"name": clean_name, "email": clean_email, "role": "hr"},
+  )
+  return True, f"HR Admin {clean_name} ({clean_email}) created successfully."
+
+
+def delete_hr_user(super_admin_email, super_admin_role, target_hr_email):
+  if super_admin_role != "admin":
+    raise PermissionError("Only Super Admin ('admin') can delete HR accounts.")
+  clean_target = target_hr_email.strip().lower()
+  with get_conn() as c:
+    row = c.execute(
+        "SELECT id, email, role FROM users WHERE email=?", (clean_target,)
+    ).fetchone()
+    if not row or row["role"] != "hr":
+      return False, f"HR account '{clean_target}' not found."
+    c.execute("DELETE FROM users WHERE id=?", (row["id"],))
+    c.commit()
+  log_audit(
+      actor_email=super_admin_email,
+      actor_role=super_admin_role,
+      action_type="DELETE",
+      target_entity="user",
+      target_id=clean_target,
+      old_value={"email": clean_target, "role": "hr"},
+      new_value=None,
+  )
+  return True, f"HR Admin ({clean_target}) has been deleted."
+
+
+def delete_intern_access(actor_email, actor_role, internship_id):
+  """Allows Admin ('admin') and HR ('hr') to revoke/delete an intern's portal login access."""
+  if actor_role not in ("admin", "hr"):
+    raise PermissionError(
+        "Only Admin or HR can revoke/delete intern portal access."
+    )
+  with get_conn() as c:
+    intern = c.execute(
+        "SELECT internship_id, full_name, email, status FROM interns WHERE"
+        " internship_id=?",
+        (internship_id,),
+    ).fetchone()
+    if not intern:
+      return False, f"Intern '{internship_id}' not found."
+
+    clean_email = (intern["email"] or "").strip().lower()
+    old_status = intern["status"]
+
+    # 1. Delete intern login credentials from users table
+    c.execute(
+        "DELETE FROM users WHERE lower(email)=? AND role='intern'",
+        (clean_email,),
+    )
+    # 2. Mark intern record as Access Revoked so historical reports/docs remain intact
+    c.execute(
+        "UPDATE interns SET status='Access Revoked' WHERE internship_id=?",
+        (internship_id,),
     )
     c.commit()
 
+  log_audit(
+      actor_email=actor_email,
+      actor_role=actor_role,
+      action_type="DELETE",
+      target_entity="intern",
+      target_id=internship_id,
+      old_value={
+          "email": clean_email,
+          "full_name": intern["full_name"],
+          "status": old_status,
+      },
+      new_value={"status": "Access Revoked", "login_deleted": True},
+  )
+  return (
+      True,
+      (
+          f"Portal access for {intern['full_name']} ({clean_email}) has been"
+          " deleted."
+      ),
+  )
+
+
+def change_user_password(email, old_password, new_password):
+  """Verifies old password and updates to a new alphanumeric password (letters + numbers)."""
+  clean_email = email.strip().lower()
+  if len(new_password) < 6:
+    return False, "New password must be at least 6 characters long."
+  if not (
+      any(ch.isalpha() for ch in new_password)
+      and any(ch.isdigit() for ch in new_password)
+  ):
+    return False, "New password must contain both letters and numbers."
+  if old_password == new_password:
+    return False, "New password must be different from your current password."
+
+  with get_conn() as c:
+    row = c.execute(
+        "SELECT id, password_hash FROM users WHERE email=?", (clean_email,)
+    ).fetchone()
+    if not row or not check_password(old_password, row["password_hash"]):
+      return False, "Current (old) password is incorrect."
+    c.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        (hash_password(new_password), row["id"]),
+    )
+    c.commit()
+  return True, "Password updated successfully!"
+
 
 def upsert_intern_user(email, password):
-  """Creates a new intern user or updates password if email already exists as intern."""
   with get_conn() as c:
     existing = c.execute(
         "SELECT id, role FROM users WHERE email=?", (email.lower(),)
@@ -258,13 +579,13 @@ def upsert_intern_user(email, password):
       c.commit()
 
 
-def verify_user(email, password, expected_role=None):
+def verify_user(email, password, expected_roles=None):
   with get_conn() as c:
     row = c.execute(
         "SELECT * FROM users WHERE email=?", (email.lower(),)
     ).fetchone()
     if row and check_password(password, row["password_hash"]):
-      if expected_role and row["role"] != expected_role:
+      if expected_roles and row["role"] not in expected_roles:
         return None
       return {"email": row["email"], "role": row["role"]}
     return None

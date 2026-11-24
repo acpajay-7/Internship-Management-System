@@ -3,7 +3,9 @@ from email.message import EmailMessage
 import os
 from pathlib import Path
 import random
+import secrets
 import smtplib
+import string
 import uuid
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -12,6 +14,15 @@ from reportlab.pdfgen import canvas
 def generate_5_digit_password() -> str:
   """Generates a cryptographically secure random 5-digit numeric password (10000 - 99999)."""
   return str(random.SystemRandom().randint(10000, 99999))
+
+
+def generate_random_alphanumeric_password(length: int = 8) -> str:
+  """Generates a secure random alphanumeric password containing both letters and digits."""
+  alphabet = string.ascii_letters + string.digits
+  while True:
+    pwd = "".join(secrets.choice(alphabet) for _ in range(length))
+    if any(c.isalpha() for c in pwd) and any(c.isdigit() for c in pwd):
+      return pwd
 
 
 def save_upload(uploaded_file):
