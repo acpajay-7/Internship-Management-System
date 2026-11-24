@@ -1,0 +1,45 @@
+[
+  {
+    "id": 3,
+    "actor_email": "hr@reincrew.local",
+    "actor_role": "hr",
+    "action_type": "DOC_GENERATED",
+    "target_entity": "document",
+    "target_id": "RC-OFFER-20261124",
+    "old_value": null,
+    "new_value": {
+      "doc_type": "Offer Letter"
+    },
+    "created_at": "2026-11-24T22:40:49"
+  },
+  {
+    "id": 2,
+    "actor_email": "hr@reincrew.local",
+    "actor_role": "hr",
+    "action_type": "STATUS_CHANGE",
+    "target_entity": "application",
+    "target_id": "APP-101",
+    "old_value": {
+      "status": "Received"
+    },
+    "new_value": {
+      "status": "Selected"
+    },
+    "created_at": "2026-11-24T22:40:49"
+  },
+  {
+    "id": 1,
+    "actor_email": "admin@reincrew.local",
+    "actor_role": "admin",
+    "action_type": "CREATE",
+    "target_entity": "user",
+    "target_id": "hr@reincrew.local",
+    "old_value": null,
+    "new_value": {
+      "name": "Priya Sharma",
+      "email": "hr@reincrew.local",
+      "role": "hr"
+    },
+    "created_at": "2026-11-24T22:40:49"
+  }
+]

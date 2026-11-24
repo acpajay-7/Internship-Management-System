@@ -2,9 +2,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from datetime import date, datetime
+import json
 import os
-import streamlit as st
+from pathlib import Path
+import uuid
 import pandas as pd
+import streamlit as st
 
 # Read deployment secrets into environment variables before importing db/services.
 try:
@@ -23,17 +27,28 @@ try:
 except Exception:
   pass
 
-from pathlib import Path
-from datetime import date, datetime
-import uuid
-from db import init_db, get_conn, upsert_intern_user, verify_user, log_email
+from db import (
+    change_user_password,
+    create_hr_user,
+    delete_hr_user,
+    delete_intern_access,
+    fetch_audit_logs,
+    get_conn,
+    init_db,
+    log_audit,
+    log_email,
+    submit_application_idempotent,
+    upsert_intern_user,
+    verify_user,
+)
 from services import (
-    send_email,
-    make_offer_letter_pdf,
-    make_letter_pdf,
-    save_upload,
     auto_assign_stream_tasks,
     generate_5_digit_password,
+    generate_random_alphanumeric_password,
+    make_letter_pdf,
+    make_offer_letter_pdf,
+    save_upload,
+    send_email,
 )
 
 st.set_page_config(
@@ -61,7 +76,36 @@ def notify(to_email, subject, body, attachment_path=None):
   return ok, detail
 
 
-def check_and_auto_issue_completion(internship_id):
+def render_change_password_section(current_email: str):
+  st.header("Change Password")
+  st.caption(
+      "Update your account password. Your new password must be at least 6"
+      " characters and include both letters and numbers."
+  )
+  with st.form("change_password_form", clear_on_submit=True):
+    old_pwd = st.text_input("Current (Old) Password *", type="password")
+    new_pwd = st.text_input(
+        "New Password (letters + numbers) *", type="password"
+    )
+    confirm_pwd = st.text_input("Confirm New Password *", type="password")
+    submit_pwd = st.form_submit_button("Update Password", type="primary")
+
+  if submit_pwd:
+    if not old_pwd or not new_pwd or not confirm_pwd:
+      st.error("Please fill in all password fields.")
+    elif new_pwd != confirm_pwd:
+      st.error("New password and confirm password do not match.")
+    else:
+      ok, msg = change_user_password(current_email, old_pwd, new_pwd)
+      if ok:
+        st.success(msg)
+      else:
+        st.error(msg)
+
+
+def check_and_auto_issue_completion(
+    internship_id, actor_email="system", actor_role="admin"
+):
   """Checks if all assigned tasks for an intern are Approved; if so, auto-generates Completion Letter PDF."""
   total_tasks = int(
       df_query(
@@ -115,6 +159,19 @@ def check_and_auto_issue_completion(internship_id):
             datetime.now().isoformat(),
         ),
     )
+    log_audit(
+        actor_email=actor_email,
+        actor_role=actor_role,
+        action_type="DOC_GENERATED",
+        target_entity="document",
+        target_id=cert_id,
+        old_value=None,
+        new_value={
+            "doc_type": "Completion Letter",
+            "internship_id": internship_id,
+            "auto_issued": True,
+        },
+    )
     notify(
         person["email"],
         f"ReinCrew Internship Completion Letter ({cert_id})",
@@ -138,7 +195,7 @@ def logout():
 
 
 st.title("🎓 ReinCrew Internship Management System")
-st.caption("MVP prototype — application to internship completion")
+st.caption("Production-ready — application to internship completion")
 
 # ─── Public Landing Interface (3 Distinct Tabs) ────────────────────────────────
 if "user" not in st.session_state:
@@ -202,40 +259,25 @@ if "user" not in st.session_state:
       elif "@" not in email or "." not in email.split("@")[-1]:
         st.error("Please enter a valid email address.")
       else:
-        existing = df_query(
-            "SELECT application_id, status FROM applications WHERE"
-            " lower(email)=lower(?) AND status IN ('Received', 'Under Review',"
-            " 'Shortlisted', 'Interview Scheduled')",
-            (email.strip(),),
+        resume_path = save_upload(resume) if resume else ""
+        res = submit_application_idempotent(
+            full_name=full_name,
+            email=email,
+            phone=phone,
+            college=college,
+            education=education,
+            skills=skills,
+            preferred_domain=preferred_domain,
+            resume_path=resume_path,
         )
-        if not existing.empty:
-          prev_id = existing.iloc[0]["application_id"]
-          prev_status = existing.iloc[0]["status"]
+        if res["status"] == "duplicate_ignored":
           st.warning(
-              f"An active application ({prev_id} — {prev_status}) already"
-              " exists for this email address."
+              f"An active application ({res['application_id']} —"
+              f" {res['current_status']}) already exists for this email"
+              " address."
           )
         else:
-          resume_path = save_upload(resume) if resume else ""
-          app_id = "APP-" + uuid.uuid4().hex[:10].upper()
-          execute(
-              """INSERT INTO applications
-              (application_id, full_name, email, phone, college, education, skills, preferred_domain, resume_path, status, created_at)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-              (
-                  app_id,
-                  full_name.strip(),
-                  email.strip(),
-                  phone.strip(),
-                  college.strip(),
-                  education.strip(),
-                  skills.strip(),
-                  preferred_domain,
-                  resume_path,
-                  "Received",
-                  datetime.now().isoformat(timespec="seconds"),
-              ),
-          )
+          app_id = res["application_id"]
           notify(
               email.strip(),
               "ReinCrew application received",
@@ -246,26 +288,27 @@ if "user" not in st.session_state:
               ),
           )
           st.success(
-              f"Application submitted successfully! Your Application ID is {app_id}"
+              "Application submitted successfully! Your Application ID is"
+              f" {app_id}"
           )
 
   with student_login_tab:
     st.subheader("🎓 Student / Intern Login")
     st.caption(
-        "Selected candidates: log in with your registered email and the"
-        " 5-digit password sent to your email."
+        "Selected candidates: log in with your registered email and your"
+        " portal password."
     )
     with st.form("student_login_form"):
       student_email = st.text_input("Registered Student Email")
-      student_password = st.text_input(
-          "5-Digit Password", type="password", placeholder="e.g. 48291"
-      )
+      student_password = st.text_input("Password", type="password")
       do_student_login = st.form_submit_button(
           "Login as Student", type="primary"
       )
     if do_student_login:
       user = verify_user(
-          student_email.strip().lower(), student_password, expected_role="intern"
+          student_email.strip().lower(),
+          student_password,
+          expected_roles=["intern"],
       )
       if user:
         st.session_state["user"] = user["email"]
@@ -273,44 +316,48 @@ if "user" not in st.session_state:
         st.rerun()
       else:
         st.error(
-            "Invalid student credentials or your application has not been"
-            " selected yet."
+            "Invalid student credentials, access revoked, or your application"
+            " has not been selected yet."
         )
 
   with admin_login_tab:
-    st.subheader("🛡️ Administrator Login")
-    st.caption("Authorized ReinCrew coordinators and administrators only.")
+    st.subheader("🛡️ Administrator / HR Login")
+    st.caption("Authorized ReinCrew Super Admins and HR Coordinators only.")
     with st.form("admin_login_form"):
-      admin_email = st.text_input("Admin Email")
-      admin_password = st.text_input("Admin Password", type="password")
-      do_admin_login = st.form_submit_button("Login as Admin", type="primary")
+      admin_email = st.text_input("Admin / HR Email")
+      admin_password = st.text_input("Password", type="password")
+      do_admin_login = st.form_submit_button("Login", type="primary")
     if do_admin_login:
       user = verify_user(
-          admin_email.strip().lower(), admin_password, expected_role="admin"
+          admin_email.strip().lower(),
+          admin_password,
+          expected_roles=["admin", "hr"],
       )
       if user:
         st.session_state["user"] = user["email"]
         st.session_state["role"] = user["role"]
         st.rerun()
       else:
-        st.error("Invalid administrator email or password.")
+        st.error("Invalid administrator or HR email/password.")
 
   st.stop()
 
 # ─── Authenticated Area ────────────────────────────────────────────────────────
 user_email = st.session_state["user"]
 role = st.session_state["role"]
+role_label = "SUPER ADMIN" if role == "admin" else role.upper()
+
 with st.sidebar:
   st.success(f"Signed in: {user_email}")
-  st.caption(f"Role: {role.upper()}")
+  st.caption(f"Role: {role_label}")
   if st.button("Logout"):
     logout()
 
-if role == "admin":
-  # Removed "Admin users" page — student accounts are now auto-registered upon selection
+if role in ("admin", "hr"):
   pages = [
       "Overview",
       "Applications",
+      "Interns & Access",
       "Internships",
       "Tasks",
       "Stream Templates",
@@ -318,14 +365,23 @@ if role == "admin":
       "Completion letters",
       "Email log",
   ]
-  page = st.sidebar.radio("Admin navigation", pages)
+  if role == "admin":
+    pages.extend(["Audit logs", "Manage HR Admins"])
+  if role == "hr":
+    pages.append("Change Password")
+
+  page = st.sidebar.radio("Admin / HR navigation", pages)
 
   if page == "Overview":
-    st.header("Admin dashboard")
+    st.header("Admin & HR dashboard")
     cols = st.columns(4)
     for col, label, sql in [
         (cols[0], "Applications", "SELECT COUNT(*) n FROM applications"),
-        (cols[1], "Selected interns", "SELECT COUNT(*) n FROM interns"),
+        (
+            cols[1],
+            "Active interns",
+            "SELECT COUNT(*) n FROM interns WHERE status!='Access Revoked'",
+        ),
         (
             cols[2],
             "Open tasks",
@@ -439,6 +495,7 @@ if role == "admin":
         )
 
         if st.button("Save application decision", type="primary"):
+          old_status = record["status"]
           full_notes = (
               f"{notes}\nInterview Details: {interview_link}".strip()
               if interview_link
@@ -448,6 +505,15 @@ if role == "admin":
               "UPDATE applications SET status=?, admin_notes=? WHERE"
               " application_id=?",
               (new_status, full_notes, selected_id),
+          )
+          log_audit(
+              actor_email=user_email,
+              actor_role=role,
+              action_type="STATUS_CHANGE",
+              target_entity="application",
+              target_id=selected_id,
+              old_value={"status": old_status},
+              new_value={"status": new_status},
           )
 
           if new_status == "Selected":
@@ -487,6 +553,19 @@ if role == "admin":
                       "Active",
                   ),
               )
+              log_audit(
+                  actor_email=user_email,
+                  actor_role=role,
+                  action_type="CREATE",
+                  target_entity="intern",
+                  target_id=intern_id,
+                  old_value=None,
+                  new_value={
+                      "application_id": selected_id,
+                      "email": record["email"],
+                      "domain": domain,
+                  },
+              )
 
               # 2. Auto-register Student/Intern Login with random 5-digit password
               upsert_intern_user(record["email"], temp_password)
@@ -513,6 +592,19 @@ if role == "admin":
                       str(offer_pdf_path),
                       datetime.now().isoformat(),
                   ),
+              )
+              log_audit(
+                  actor_email=user_email,
+                  actor_role=role,
+                  action_type="DOC_GENERATED",
+                  target_entity="document",
+                  target_id=offer_id,
+                  old_value=None,
+                  new_value={
+                      "doc_type": "Offer Letter",
+                      "internship_id": intern_id,
+                      "recipient": record["email"],
+                  },
               )
 
               # 4. Auto-assign stream-based tasks
@@ -569,6 +661,53 @@ if role == "admin":
             )
           st.rerun()
 
+  elif page == "Interns & Access":
+    st.header("Selected Interns & Portal Access")
+    interns_df = df_query("SELECT * FROM interns ORDER BY id DESC")
+    if interns_df.empty:
+      st.info("No interns registered yet.")
+    else:
+      st.dataframe(interns_df, use_container_width=True)
+
+      active_access_interns = interns_df[
+          interns_df["status"] != "Access Revoked"
+      ]
+      if not active_access_interns.empty:
+        st.divider()
+        st.subheader("Revoke / Delete Intern Portal Access")
+        st.caption(
+            "Removes the intern's student login credentials immediately while"
+            " preserving historical reports and audit records."
+        )
+        intern_options = {
+            row["internship_id"]: (
+                f"{row['internship_id']} | {row['full_name']} ({row['email']})"
+                f" — [{row['status']}]"
+            )
+            for _, row in active_access_interns.iterrows()
+        }
+        col_sel, col_btn = st.columns([3, 1])
+        with col_sel:
+          target_intern_id = st.selectbox(
+              "Select intern to revoke/delete access",
+              options=list(intern_options.keys()),
+              format_func=lambda x: intern_options[x],
+          )
+        with col_btn:
+          st.write("")
+          st.write("")
+          if st.button(
+              "Delete Intern Access", type="primary", use_container_width=True
+          ):
+            del_ok, del_msg = delete_intern_access(
+                user_email, role, target_intern_id
+            )
+            if del_ok:
+              st.success(del_msg)
+              st.rerun()
+            else:
+              st.error(del_msg)
+
   elif page == "Internships":
     st.header("Manage internship opportunities")
     with st.form("new_internship"):
@@ -583,6 +722,20 @@ if role == "admin":
           "INSERT INTO internships(title,domain,department,duration,description,active)"
           " VALUES(?,?,?,?,?,1)",
           (title, domain, department, duration, description),
+      )
+      log_audit(
+          actor_email=user_email,
+          actor_role=role,
+          action_type="CREATE",
+          target_entity="internship",
+          target_id=title,
+          old_value=None,
+          new_value={
+              "title": title,
+              "domain": domain,
+              "department": department,
+              "duration": duration,
+          },
       )
       st.success("Internship added.")
     st.dataframe(df_query("SELECT * FROM internships"), use_container_width=True)
@@ -619,6 +772,19 @@ if role == "admin":
           " VALUES(?,?,?,?,?)",
           (t_domain, t_title.strip(), t_desc.strip(), t_prio, int(t_days)),
       )
+      log_audit(
+          actor_email=user_email,
+          actor_role=role,
+          action_type="CREATE",
+          target_entity="task_template",
+          target_id=t_title.strip(),
+          old_value=None,
+          new_value={
+              "domain": t_domain,
+              "priority": t_prio,
+              "due_days": int(t_days),
+          },
+      )
       st.success(f"Template added for {t_domain}.")
       st.rerun()
     st.dataframe(
@@ -628,7 +794,10 @@ if role == "admin":
 
   elif page == "Tasks":
     st.header("Task allocation & review")
-    interns = df_query("SELECT internship_id,full_name,email,domain FROM interns")
+    interns = df_query(
+        "SELECT internship_id,full_name,email,domain FROM interns WHERE"
+        " status!='Access Revoked'"
+    )
     with st.form("create_task"):
       task_title = st.text_input("Task title")
       task_description = st.text_area(
@@ -663,6 +832,19 @@ if role == "admin":
                 "Assigned",
                 datetime.now().isoformat(),
             ),
+        )
+        log_audit(
+            actor_email=user_email,
+            actor_role=role,
+            action_type="CREATE",
+            target_entity="task",
+            target_id=assignee,
+            old_value=None,
+            new_value={
+                "title": task_title,
+                "priority": priority,
+                "deadline": deadline.isoformat(),
+            },
         )
         person = interns[interns.internship_id == assignee].iloc[0]
         notify(
@@ -707,9 +889,20 @@ if role == "admin":
             "UPDATE tasks SET status=?, review_feedback=? WHERE id=?",
             (decision, feedback, int(task_id)),
         )
+        log_audit(
+            actor_email=user_email,
+            actor_role=role,
+            action_type="STATUS_CHANGE",
+            target_entity="task",
+            target_id=str(task_id),
+            old_value={"status": selected_task["status"]},
+            new_value={"status": decision, "feedback": feedback},
+        )
         if decision == "Approved":
           issued_cert = check_and_auto_issue_completion(
-              selected_task["internship_id"]
+              selected_task["internship_id"],
+              actor_email=user_email,
+              actor_role=role,
           )
           if issued_cert:
             st.success(
@@ -797,6 +990,19 @@ if role == "admin":
                   datetime.now().isoformat(),
               ),
           )
+          log_audit(
+              actor_email=user_email,
+              actor_role=role,
+              action_type="DOC_GENERATED",
+              target_entity="document",
+              target_id=cert_id,
+              old_value=None,
+              new_value={
+                  "doc_type": "Completion Letter",
+                  "internship_id": intern_id,
+                  "recipient": person["email"],
+              },
+          )
           notify(
               person["email"],
               f"Your ReinCrew internship completion document ({cert_id})",
@@ -827,17 +1033,133 @@ if role == "admin":
         use_container_width=True,
     )
 
+  elif page == "Audit logs" and role == "admin":
+    st.header("Super Admin: System Audit Logs")
+    logs = fetch_audit_logs(limit=200)
+    if not logs:
+      st.info("No audit logs recorded yet.")
+    else:
+      st.dataframe(pd.DataFrame(logs), use_container_width=True)
+      st.download_button(
+          "Download Audit Logs (JSON)",
+          data=json.dumps(logs, indent=2),
+          file_name="audit_logs_export.json",
+          mime="application/json",
+      )
+
+  elif page == "Manage HR Admins" and role == "admin":
+    st.header("Super Admin: Manage HR Admins")
+    st.caption(
+        "Create HR ('hr') coordinator accounts. A random alphanumeric password"
+        " will be auto-generated and emailed directly to the HR."
+    )
+    with st.form("create_hr_form", clear_on_submit=True):
+      hr_name = st.text_input("HR Full Name *", placeholder="e.g. Priya Sharma")
+      hr_email = st.text_input("HR Email *", placeholder="e.g. hr@reincrew.in")
+      create_hr_btn = st.form_submit_button(
+          "Create HR Account & Email Credentials", type="primary"
+      )
+
+    if create_hr_btn:
+      if not hr_name.strip():
+        st.error("Please enter the HR's full name.")
+      elif not hr_email.strip() or "@" not in hr_email:
+        st.error("Please enter a valid HR email address.")
+      else:
+        auto_hr_password = generate_random_alphanumeric_password(8)
+        ok, msg = create_hr_user(
+            user_email,
+            role,
+            hr_name.strip(),
+            hr_email.strip(),
+            auto_hr_password,
+        )
+        if ok:
+          subject = (
+              "Welcome to ReinCrew Internship Portal — Your HR Admin Credentials"
+          )
+          body = (
+              f"Dear {hr_name.strip()},\n\n"
+              "Welcome to the ReinCrew team! You have been granted HR Coordinator access "
+              "to the ReinCrew Internship Management Portal.\n\n"
+              "--- YOUR HR PORTAL LOGIN CREDENTIALS ---\n"
+              "Login Tab: Admin Login\n"
+              f"Name: {hr_name.strip()}\n"
+              f"Email: {hr_email.strip().lower()}\n"
+              f"Password: {auto_hr_password}\n"
+              "Role: HR Coordinator\n"
+              "-----------------------------------------\n\n"
+              "What you can manage on the portal:\n"
+              "- Review and shortlist internship applications\n"
+              "- Select candidates (auto-generates Offer Letters & assigns stream tasks)\n"
+              "- Assign and review daily/weekly intern tasks\n"
+              "- Monitor daily progress reports and issue completion certificates\n"
+              "- Update your password anytime from the 'Change Password' tab\n\n"
+              "For security, please keep your credentials confidential.\n\n"
+              "Best regards,\n"
+              "Admin Team\n"
+              "ReinCrew Internship Program"
+          )
+          mail_ok, mail_detail = notify(hr_email.strip().lower(), subject, body)
+          if mail_ok:
+            st.success(f"{msg} Auto-generated credentials sent via email!")
+          else:
+            st.warning(
+                f"{msg} However, email delivery reported: {mail_detail}"
+            )
+          st.rerun()
+        else:
+          st.warning(msg)
+
+    st.divider()
+    st.subheader("Active HR & Super Admin Accounts")
+    accounts = df_query(
+        "SELECT id, email, role, created_at FROM users WHERE role IN"
+        " ('admin', 'hr') ORDER BY id ASC"
+    )
+    st.dataframe(accounts, use_container_width=True)
+
+    hr_accounts = accounts[accounts["role"] == "hr"]
+    if not hr_accounts.empty:
+      st.subheader("Remove HR Coordinator Access")
+      del_col1, del_col2 = st.columns([3, 1])
+      with del_col1:
+        hr_to_delete = st.selectbox(
+            "Select HR account to delete",
+            options=hr_accounts["email"].tolist(),
+        )
+      with del_col2:
+        st.write("")
+        st.write("")
+        if st.button("Delete HR", type="primary", use_container_width=True):
+          del_ok, del_msg = delete_hr_user(user_email, role, hr_to_delete)
+          if del_ok:
+            st.success(del_msg)
+            st.rerun()
+          else:
+            st.error(del_msg)
+
+  elif page == "Change Password" and role == "hr":
+    render_change_password_section(user_email)
+
 elif role == "intern":
   page = st.sidebar.radio(
       "Intern navigation",
-      ["My dashboard", "My tasks", "Daily report", "My documents"],
+      [
+          "My dashboard",
+          "My tasks",
+          "Daily report",
+          "My documents",
+          "Change Password",
+      ],
   )
   intern = df_query(
       "SELECT * FROM interns WHERE lower(email)=lower(?)", (user_email,)
   )
-  if intern.empty:
+  if intern.empty or intern.iloc[0]["status"] == "Access Revoked":
     st.error(
-        "No intern profile is linked to this login. Contact the administrator."
+        "Your portal access is inactive or has been revoked. Contact the"
+        " administrator."
     )
     st.stop()
   person = intern.iloc[0]
@@ -944,6 +1266,9 @@ elif role == "intern":
             file_name=p.name,
             mime="application/pdf",
         )
+
+  elif page == "Change Password":
+    render_change_password_section(user_email)
 
 else:
   st.error("Unknown account role. Contact the administrator.")
