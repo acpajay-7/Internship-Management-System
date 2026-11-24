@@ -70,6 +70,10 @@ class _LibsqlCursorWrapper:
     cols = [d[0] for d in self._cur.description]
     return [_DictRow(cols, r) for r in rows]
 
+  def close(self):
+    if hasattr(self._cur, "close"):
+      self._cur.close()
+
 
 class _LibsqlConnWrapper:
   """Makes libsql connection compatible with sqlite3 context managers, row access, and pandas."""
